@@ -1,6 +1,7 @@
-package logger
+package RTLogger
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"time"
@@ -8,7 +9,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-func InitLogger(logFile string) (zerolog.Logger, error) {
+func InitRTLogger(logFile string, ctr int) (zerolog.Logger, error) {
 
 	fileWriter, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -22,7 +23,7 @@ func InitLogger(logFile string) (zerolog.Logger, error) {
 
 	logger := zerolog.New(multiWriter).With().Timestamp().Logger()
 
-	logger.Info().Str("message", "This message is written to the log file").Msg("")
+	logger.Info().Str("message", fmt.Sprintf("This message %d is written to the log file", ctr)).Msg("")
 
 	return logger, nil
 }

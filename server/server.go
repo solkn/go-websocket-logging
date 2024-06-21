@@ -1,13 +1,17 @@
-package main
+package server
 
 import (
 	"bufio"
-	"encoding/json"
-	"go-websocket-logging/logger"
+	"fmt"
+	"go-websocket-logging/RTLogger"
 	"log"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
+	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -36,7 +40,7 @@ func generateClientID() string {
 	return id.String()
 }
 
-func wsHandler(c *gin.Context) {
+func WsHandler(c *gin.Context) {
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("Failed to upgrade connection: %v", err)
@@ -49,10 +53,20 @@ func wsHandler(c *gin.Context) {
 
 	log.Printf("Client %s connected\n", clientID)
 
-	welcomeMessage := []byte("Welcome client!")
-	if err := conn.WriteMessage(websocket.TextMessage, welcomeMessage); err != nil {
-		log.Println("Error sending welcome message:", err)
-	}
+	// welcomeMessage := []byte("Welcome client!")
+	// if err := conn.WriteMessage(websocket.TextMessage, welcomeMessage); err != nil {
+	// 	log.Println("Error sending welcome message:", err)
+	// }
+
+	logFile := "go-websocket-logging.log"
+
+	ctr, _ := countLines(logFile)
+
+	RTLogger.InitRTLogger(logFile, ctr)
+
+	go KeepWritinglog()
+
+	go watchLogFile(logFile)
 
 	sendLogFileInfos(conn)
 
@@ -63,7 +77,7 @@ func wsHandler(c *gin.Context) {
 				log.Printf("Client %s disconnected\n", clientID)
 				delete(clients, clientID)
 				break
-			} else { 
+			} else {
 				log.Printf("Client %s disconnected\n", clientID)
 
 				break
@@ -81,7 +95,6 @@ func handleMessages(c *client, clientID string, messageType int, message []byte)
 }
 
 func sendLogFileInfos(conn *websocket.Conn) {
-
 	logFile := "go-websocket-logging.log"
 
 	file, err := os.Open(logFile)
@@ -93,25 +106,17 @@ func sendLogFileInfos(conn *websocket.Conn) {
 
 	scanner := bufio.NewScanner(file)
 
-	sentMessages := make(map[string]struct{})
-
 	for scanner.Scan() {
-		message := scanner.Text()
+		line := scanner.Text()
 
-		var jsonData map[string]interface{}
-		if err := json.Unmarshal([]byte(message), &jsonData); err == nil {
-			if messageValue, ok := jsonData["message"]; ok {
-				message, ok := messageValue.(string)
-				if ok {
-					if _, exists := sentMessages[message]; !exists {
-						if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
-							log.Printf("Error sending log message to client: %v", err)
-							return
-						}
-						sentMessages[message] = struct{}{}
-					}
-				}
-			}
+		if line == "\n" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		err := conn.WriteMessage(websocket.TextMessage, []byte(line))
+		if err != nil {
+			log.Printf("Error sending log message to client: %v", err)
+			return
 		}
 	}
 
@@ -119,17 +124,118 @@ func sendLogFileInfos(conn *websocket.Conn) {
 		log.Printf("Error scanning log file: %v", err)
 	}
 
+	fmt.Println("Sent all messages from log file")
+
 }
 
-func main() {
+func KeepWritinglog() {
 
-	logFile := "go-websocket-logging.log"
+	for i := 0; i < 1000; i++ {
+		time.Sleep(10 * time.Second)
+		logFile := "go-websocket-logging.log"
 
-	logger.InitLogger(logFile)
+		ctr, _ := countLines(logFile)
 
-	router := gin.Default()
-	router.GET("/ws", wsHandler)
+		RTLogger.InitRTLogger(logFile, ctr)
+	}
+}
 
-	log.Println("Server started on :8080")
-	log.Fatal(router.Run(":8080"))
+func countLines(filePath string) (int, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	count := 0
+	for scanner.Scan() {
+		count++
+	}
+
+	return count, scanner.Err()
+}
+
+func watchLogFile(filePath string) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatalf("Failed to create watcher: %v", err)
+	}
+	defer watcher.Close()
+
+	err = watcher.Add(filePath)
+	if err != nil {
+		log.Fatalf("Failed to watch file %s: %v", filePath, err)
+	}
+
+	log.Printf("Started watching file: %s\n", filePath)
+
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				log.Println("event1.", event)
+
+				log.Println("Watcher closed or program exiting. Stopping monitoring.")
+				return
+			}
+			if event.Op&fsnotify.Write == fsnotify.Write {
+				log.Println("event2.", event)
+
+				log.Println("File modified. Notifying clients.")
+				// notifyClients(filePath)
+				debouncedNotifyClients(filePath)
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				log.Println("Watcher errors channel closed. Stopping monitoring.")
+				return
+			}
+			log.Println("Error watching file:", err)
+		}
+
+	}
+}
+
+func debouncedNotifyClients(filePath string) {
+	var mutex sync.Mutex
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	time.Sleep(10 * time.Second)
+	notifyClients(filePath)
+}
+func notifyClients(filePath string) {
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		log.Printf("Error opening log file: %v", err)
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+
+	lastSentLines := make(map[string]string)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		for _, client := range clients {
+			if lastSentLine, ok := lastSentLines[client.id]; !ok || line != lastSentLine {
+				if err := client.conn.WriteMessage(websocket.TextMessage, []byte(line)); err != nil {
+					log.Printf("Error sending log message to client: %v", err)
+					client.conn.Close()
+					delete(clients, client.id)
+				}
+				lastSentLines[client.id] = line
+			}
+		}
+	}
+
+	log.Println("notify,", lastSentLines)
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("Error scanning log file: %v", err)
+	}
 }

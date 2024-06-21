@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -9,9 +10,14 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+var messageFormat string
+
 func main() {
 	origin := "http://localhost:8080"
 	url := "ws://localhost:8080/ws"
+
+	fmt.Println("Choose message format (json or text): ")
+	fmt.Scanln(&messageFormat)
 
 	for {
 		log.Println("Attempting to connect to the server")
@@ -20,7 +26,7 @@ func main() {
 		conn, _, err = websocket.DefaultDialer.Dial(url, http.Header{"Origin": {origin}})
 		if err != nil {
 			log.Println("Dial error:", err)
-			time.Sleep(5 * time.Second)
+			time.Sleep(2 * time.Second)
 			continue
 		}
 		log.Println("Connected to the server")
@@ -39,15 +45,32 @@ func main() {
 
 			if userInput != "" {
 				log.Printf("Sending message: %s\n", userInput)
-				if err := conn.WriteMessage(websocket.TextMessage, []byte(userInput)); err != nil {
+				if err := sendMessage(conn, userInput); err != nil {
 					log.Println("Error sending message:", err)
-					break 
+					break
 				}
 			} else {
 				log.Println("Exiting message loop")
 				break
 			}
 		}
+	}
+}
+
+func sendMessage(conn *websocket.Conn, message string) error {
+	if messageFormat == "json" {
+
+		var data map[string]interface{}
+
+		jsonData, err := json.Marshal(data)
+		if err != nil {
+			return err
+		}
+		return conn.WriteMessage(websocket.TextMessage, jsonData)
+	} else if messageFormat == "text" {
+		return conn.WriteMessage(websocket.TextMessage, []byte(message))
+	} else {
+		return fmt.Errorf("Invalid message format: %s", messageFormat)
 	}
 }
 
@@ -59,6 +82,19 @@ func readMessages(conn *websocket.Conn) {
 			log.Println("Read error:", err)
 			return
 		}
-		fmt.Printf("Received message: %s\n", message)
+
+		if messageFormat == "json" {
+			var data map[string]interface{}
+			err := json.Unmarshal(message, &data)
+			if err != nil {
+				fmt.Println("Error decoding JSON:", err)
+				continue
+			}
+			fmt.Println("Received message (JSON):", data)
+		} else if messageFormat == "text" {
+			fmt.Printf("Received message: %s\n", message)
+		} else {
+			fmt.Println("Invalid message format:", messageFormat)
+		}
 	}
 }
