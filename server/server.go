@@ -1,9 +1,9 @@
 package server
-
 import (
 	"bufio"
 	"fmt"
 	"go-websocket-logging/RTLogger"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -26,11 +26,15 @@ var upgrader = websocket.Upgrader{
 }
 
 type client struct {
-	conn *websocket.Conn
-	id   string
+	conn        *websocket.Conn
+	id          string
+	lastSentPos int64
 }
 
 var clients = map[string]*client{}
+var clientsMutex = &sync.Mutex{}
+var fileMutex = &sync.Mutex{}
+var lastReadPos int64
 
 func generateClientID() string {
 	id, err := uuid.NewRandom()
@@ -49,37 +53,33 @@ func WsHandler(c *gin.Context) {
 
 	clientID := generateClientID()
 	newClient := &client{conn: conn, id: clientID}
+	clientsMutex.Lock()
 	clients[clientID] = newClient
+	clientsMutex.Unlock()
 
 	log.Printf("Client %s connected\n", clientID)
-
-	// welcomeMessage := []byte("Welcome client!")
-	// if err := conn.WriteMessage(websocket.TextMessage, welcomeMessage); err != nil {
-	// 	log.Println("Error sending welcome message:", err)
-	// }
 
 	logFile := "go-websocket-logging.log"
 
 	ctr, _ := countLines(logFile)
-
 	RTLogger.InitRTLogger(logFile, ctr)
 
 	go KeepWritinglog()
-
 	go watchLogFile(logFile)
 
-	sendLogFileInfos(conn)
+	sendLogFileInfos(newClient, logFile)
 
 	for {
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsCloseError(err) {
 				log.Printf("Client %s disconnected\n", clientID)
+				clientsMutex.Lock()
 				delete(clients, clientID)
+				clientsMutex.Unlock()
 				break
 			} else {
 				log.Printf("Client %s disconnected\n", clientID)
-
 				break
 			}
 		}
@@ -87,22 +87,22 @@ func WsHandler(c *gin.Context) {
 	}
 
 	conn.Close()
-
 }
 
 func handleMessages(c *client, clientID string, messageType int, message []byte) {
 	// This function handles messages from clients, but you can leave it empty for now
 }
 
-func sendLogFileInfos(conn *websocket.Conn) {
-	logFile := "go-websocket-logging.log"
-
-	file, err := os.Open(logFile)
+func sendLogFileInfos(client *client, filePath string) {
+	file, err := os.Open(filePath)
 	if err != nil {
 		log.Printf("Error opening log file: %v", err)
 		return
 	}
 	defer file.Close()
+
+	fileMutex.Lock()
+	defer fileMutex.Unlock()
 
 	scanner := bufio.NewScanner(file)
 
@@ -113,11 +113,13 @@ func sendLogFileInfos(conn *websocket.Conn) {
 			continue
 		}
 
-		err := conn.WriteMessage(websocket.TextMessage, []byte(line))
+		err := client.conn.WriteMessage(websocket.TextMessage, []byte(line))
 		if err != nil {
 			log.Printf("Error sending log message to client: %v", err)
+			client.conn.Close()
 			return
 		}
+		client.lastSentPos, _ = file.Seek(0, io.SeekCurrent)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -125,17 +127,14 @@ func sendLogFileInfos(conn *websocket.Conn) {
 	}
 
 	fmt.Println("Sent all messages from log file")
-
 }
 
 func KeepWritinglog() {
-
 	for i := 0; i < 1000; i++ {
 		time.Sleep(10 * time.Second)
 		logFile := "go-websocket-logging.log"
 
 		ctr, _ := countLines(logFile)
-
 		RTLogger.InitRTLogger(logFile, ctr)
 	}
 }
@@ -175,15 +174,12 @@ func watchLogFile(filePath string) {
 		case event, ok := <-watcher.Events:
 			if !ok {
 				log.Println("event1.", event)
-
 				log.Println("Watcher closed or program exiting. Stopping monitoring.")
 				return
 			}
 			if event.Op&fsnotify.Write == fsnotify.Write {
 				log.Println("event2.", event)
-
 				log.Println("File modified. Notifying clients.")
-				// notifyClients(filePath)
 				debouncedNotifyClients(filePath)
 			}
 		case err, ok := <-watcher.Errors:
@@ -193,7 +189,6 @@ func watchLogFile(filePath string) {
 			}
 			log.Println("Error watching file:", err)
 		}
-
 	}
 }
 
@@ -205,8 +200,8 @@ func debouncedNotifyClients(filePath string) {
 	time.Sleep(10 * time.Second)
 	notifyClients(filePath)
 }
-func notifyClients(filePath string) {
 
+func notifyClients(filePath string) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		log.Printf("Error opening log file: %v", err)
@@ -214,28 +209,36 @@ func notifyClients(filePath string) {
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
+	fileMutex.Lock()
+	defer fileMutex.Unlock()
 
-	lastSentLines := make(map[string]string)
+	clientsMutex.Lock()
+	defer clientsMutex.Unlock()
 
-	for scanner.Scan() {
-		line := scanner.Text()
+	for _, client := range clients {
+		file.Seek(client.lastSentPos, io.SeekStart)
+		scanner := bufio.NewScanner(file)
+		var buffer []string
 
-		for _, client := range clients {
-			if lastSentLine, ok := lastSentLines[client.id]; !ok || line != lastSentLine {
-				if err := client.conn.WriteMessage(websocket.TextMessage, []byte(line)); err != nil {
-					log.Printf("Error sending log message to client: %v", err)
-					client.conn.Close()
-					delete(clients, client.id)
-				}
-				lastSentLines[client.id] = line
+		for scanner.Scan() {
+			line := scanner.Text()
+			buffer = append(buffer, line)
+			client.lastSentPos, _ = file.Seek(0, io.SeekCurrent)
+		}
+
+		if err := scanner.Err(); err != nil {
+			log.Printf("Error scanning log file: %v", err)
+		}
+
+		for _, line := range buffer {
+			if err := client.conn.WriteMessage(websocket.TextMessage, []byte(line)); err != nil {
+				log.Printf("Error sending log message to client: %v", err)
+				client.conn.Close()
+				delete(clients, client.id)
+				break
 			}
 		}
-	}
 
-	log.Println("notify,", lastSentLines)
-
-	if err := scanner.Err(); err != nil {
-		log.Printf("Error scanning log file: %v", err)
+		buffer = buffer[:0]
 	}
 }
